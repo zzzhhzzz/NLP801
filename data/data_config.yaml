@@ -1,0 +1,4 @@
+datasets:
+  - json_path: /vast/users/xiaodan/haozezhao/data/mini_o3_simple_export/train_latent_minio3.json
+    images_folder: /
+    sampling_strategy: "all"
