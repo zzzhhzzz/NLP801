@@ -38,9 +38,11 @@ local_rank = None
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
+    model_name_or_path: Optional[str] = field(
+        default="/vast/users/xiaodan/haozezhao/model/Qwen2.5-VL-3B-Instruct"
+    )
     flash_attn_2_enabled: bool = field(default=True)
-    model_type: str = field(default="qwen2vl", metadata={"help": "model type: qwen2vl or qwen25vl"})
+    model_type: str = field(default="qwen25vl", metadata={"help": "model type: qwen2vl or qwen25vl"})
 
 @dataclass
 class DataArguments:
