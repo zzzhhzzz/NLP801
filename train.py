@@ -20,8 +20,6 @@ from LaVCOT.utils import dump_args_to_json
 from LaVCOT.constants import (
     IGNORE_INDEX,
     ADDITIONAL_SPECIAL_TOKENS,
-    DEFAULT_POINTER_START_TOKEN,
-    DEFAULT_POINTER_END_TOKEN,
     DEFAULT_POINTER_PAD_TOKEN,
 )
 
@@ -114,10 +112,8 @@ def smart_tokenizer_and_embedding_resize(
 
 
 def update_pointer_token_ids(model_config: transformers.PretrainedConfig, tokenizer: transformers.PreTrainedTokenizer):
-    model_config.pointer_start_token_id = tokenizer.encode(DEFAULT_POINTER_START_TOKEN)[0]
-    model_config.pointer_end_token_id = tokenizer.encode(DEFAULT_POINTER_END_TOKEN)[0]
     model_config.pointer_pad_token_id = tokenizer.encode(DEFAULT_POINTER_PAD_TOKEN)[0]
-    rank0_print(f"Updated pointer token ids: {model_config.pointer_pad_token_id}, {model_config.pointer_start_token_id}, {model_config.pointer_end_token_id}")
+    rank0_print(f"Updated pointer token id: {model_config.pointer_pad_token_id}")
 
 def setup_params_to_update(model: transformers.PreTrainedModel, training_args: TrainingArguments):
     if training_args.unfreeze_all_parameters:

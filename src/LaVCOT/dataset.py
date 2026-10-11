@@ -4,7 +4,6 @@ import math
 import os
 import random
 import re
-import ast
 from typing import Dict
 
 import torch
@@ -16,10 +15,7 @@ from torch.utils.data import Dataset
 from LaVCOT.constants import (
     IGNORE_INDEX,
     DEFAULT_IMAGE_TOKEN,
-    DEFAULT_POINTER_START_TOKEN,
     DEFAULT_POINTER_PAD_TOKEN,
-    DEFAULT_POINTER_END_TOKEN,
-    ACTION_PATTENS_XY,
     ADDITIONAL_SPECIAL_TOKENS,
     assistant_template,
     chat_template,
@@ -29,58 +25,7 @@ from LaVCOT.trainer import rank0_print
 
 
 def reformat_coordinates(text):
-    """
-    (1) Find all the coordinates in the text.
-    (2) Replace the coordinates with the special tokens.
-    (3) Return the new text and the coordinates as a list of (x, y), where x in [0, 1] and y in [0, 1].
-    """
-    epsilon = 0.001
-    def adjust_coord(c):
-        """
-        Adjust coordinate if it is too close to 0 or 1.
-        """
-        if abs(c) < epsilon:
-            return epsilon
-        elif abs(c - 1) < epsilon:
-            return 1 - epsilon
-        return c
-
-    all_matches = []
-    for pattern in ACTION_PATTENS_XY:
-        matches = list(re.finditer(pattern, text))
-        for match in matches:
-            all_matches.append((match.start(), match.groups()))
-        if pattern == ACTION_PATTENS_XY[0]:
-            target_text = f"{DEFAULT_POINTER_START_TOKEN}{DEFAULT_POINTER_PAD_TOKEN}{DEFAULT_POINTER_END_TOKEN}"
-        else:
-            target_text = f"{DEFAULT_POINTER_START_TOKEN}{DEFAULT_POINTER_PAD_TOKEN}{DEFAULT_POINTER_END_TOKEN}, {DEFAULT_POINTER_START_TOKEN}{DEFAULT_POINTER_PAD_TOKEN}{DEFAULT_POINTER_END_TOKEN}"
-        text = re.sub(
-            pattern,
-            target_text,
-            text
-        )
-    
-    coordinates = []
-    all_matches.sort(key=lambda x: x[0])
-    # Extract coordinates in order
-    for _, groups in all_matches:
-        # When two coordinate values are found, parse them as one (x, y) pair.
-        if len(groups) == 2:
-            x_str, y_str = groups
-            x = adjust_coord(ast.literal_eval(x_str))
-            y = adjust_coord(ast.literal_eval(y_str))
-            coordinates.append((x, y))
-        # When four coordinate values are found, parse them as two pairs.
-        elif len(groups) == 4:
-            x1_str, y1_str, x2_str, y2_str = groups
-            x1 = adjust_coord(ast.literal_eval(x1_str))
-            y1 = adjust_coord(ast.literal_eval(y1_str))
-            x2 = adjust_coord(ast.literal_eval(x2_str))
-            y2 = adjust_coord(ast.literal_eval(y2_str))
-            coordinates.append((x1, y1))
-            coordinates.append((x2, y2))
-    
-    return text, coordinates
+    return text, []
 
 def get_token_index(image_processor, image, point_x, point_y):
     """
@@ -177,8 +122,6 @@ class LazySupervisedDataset(Dataset):
         self.list_data_dict = []
         self.list_image_path = []
         self.pointer_pad_token_id = tokenizer.encode(DEFAULT_POINTER_PAD_TOKEN)[0]
-        self.pointer_start_token_id = tokenizer.encode(DEFAULT_POINTER_START_TOKEN)[0]
-        self.pointer_end_token_id = tokenizer.encode(DEFAULT_POINTER_END_TOKEN)[0]
 
         # Handle multiple JSON files specified in the data_path
         if "{" in data_path and "}" in data_path:
@@ -363,7 +306,7 @@ class LazySupervisedDataset(Dataset):
         processor: transformers.ProcessorMixin,
         image: list,
         system_message: str = grounding_system_message,
-        agent_mode: bool = True,
+        agent_mode: bool = False,
         chat_template: str = chat_template,
         assistant_template: str = assistant_template,
         id: int = None,
@@ -450,39 +393,26 @@ class LazySupervisedDataset(Dataset):
                         "end_turn": conv.get("end_turn", True),
                         "bbox_gt": conv.get("bbox_gt", None),
                     }
-                    if conv["recipient"] == "os":
-                        if len(image_inputs) == 0:
-                            raise ValueError("No image found for visual grounding")
-                        # replace the coordinates with the special tokens
-                        text, coord = reformat_coordinates(conv["content"][0]["text"])
-                        conv["content"][0]["text"] = text
-                        # rank0_print(f"coord: {coord}")
-
-                        # get the visual token indices of the coordinates
-                        coordinates.extend(coord)
-                        for (point_x, point_y) in coord:
-                            visual_token_index = get_token_index(
-                                processor.image_processor,
-                                image_list,
-                                point_x,
-                                point_y
-                            )
-                            # px, py = token_index_to_coordinates(
-                            #     processor.image_processor,
-                            #     visual_token_index,
-                            #     image_list[0].size[0], # make sure the size here is after qwen2vl processing
-                            #     image_list[0].size[1]
-                            # )
-                            # rank0_print(f"estimated px: {px}, py: {py}")
-                            visual_token_indices_of_coordinates.append(visual_token_index)
-
-                            if conv["bbox_gt"] is not None:
-                                patch_mask = get_multi_patch_labels(
-                                    processor.image_processor,
-                                    image_list,
-                                    conv["bbox_gt"]
-                                )  
-                                multi_patch_labels.append(patch_mask)
+                    if len(image_inputs) == 0:
+                        raise ValueError("No image found for visual grounding")
+                    text, coord = reformat_coordinates(conv["content"][0]["text"])
+                    conv["content"][0]["text"] = text
+                    coordinates.extend(coord)
+                    for (point_x, point_y) in coord:
+                        visual_token_index = get_token_index(
+                            processor.image_processor,
+                            image_list,
+                            point_x,
+                            point_y
+                        )
+                        visual_token_indices_of_coordinates.append(visual_token_index)
+                    if conv["bbox_gt"] is not None:
+                        patch_mask = get_multi_patch_labels(
+                            processor.image_processor,
+                            image_list,
+                            conv["bbox_gt"]
+                        )
+                        multi_patch_labels.append(patch_mask)
 
                 templated_conv = tokenizer.apply_chat_template(
                     conversation=[conv],
@@ -500,9 +430,6 @@ class LazySupervisedDataset(Dataset):
                 target += encode_id
 
         assert len(input_id) == len(target), f"{len(input_id)} != {len(target)}"
-
-        # make the labels of all pointer_end_token_id to be IGNORE_INDEX
-        target = [IGNORE_INDEX if token == self.pointer_end_token_id else token for token in target]
 
         input_ids = torch.tensor([input_id], dtype=torch.long)
         targets = torch.tensor([target], dtype=torch.long)
