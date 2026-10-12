@@ -107,7 +107,7 @@ class VisionHead_MultiPatch(nn.Module):
             loss = F.kl_div(pred_log_probs, target_dist, reduction='batchmean')
 
         if do_single_patch and (labels is not None):
-            loss = F.cross_entropy(attn_scores, labels)
+            loss = F.cross_entropy(patch_logits, labels)
 
         return attn_weights, loss
 
@@ -276,9 +276,18 @@ class Qwen2_5_VLForConditionalGenerationWithPointer(Qwen2_5_VLForConditionalGene
                 token_ids = input_ids[i]          # shape: (seq_length,)
                 hs = hidden_states[i]             # shape: (seq_length, d_model)
 
-                # Identify visual tokens indices.
-                visual_mask = (token_ids == self.config.image_token_id)
-                visual_indices = torch.nonzero(visual_mask, as_tuple=False).squeeze(-1) # shape: (n_visual,)
+                image_token_id = self.config.image_token_id
+                mask = token_ids == image_token_id
+                if mask.any():
+                    start = torch.nonzero(mask, as_tuple=False)[0].item()
+                    rest = mask[start:]
+                    false_positions = torch.nonzero(~rest, as_tuple=False)
+                    end = start + (false_positions[0].item() if false_positions.numel() else len(rest))
+                    visual_mask = torch.zeros_like(mask, dtype=torch.bool)
+                    visual_mask[start:end] = True
+                else:
+                    visual_mask = torch.zeros_like(mask, dtype=torch.bool)
+                visual_indices = torch.nonzero(visual_mask, as_tuple=False).squeeze(-1)
 
                 # Identify target tokens (the ones that should attend to visual features).
                 target_mask = (token_ids == self.config.pointer_pad_token_id)
@@ -292,7 +301,7 @@ class Qwen2_5_VLForConditionalGenerationWithPointer(Qwen2_5_VLForConditionalGene
                     gt = torch.tensor([0]).to(hs.device) # take the first visual token as the dummy ground truth
                     if if_multi_patch:  # task the first 4 visual tokens as the ground truth
                         sample_labels = torch.zeros_like(visual_indices).unsqueeze(0)
-                        sample_labels[0][:4] = 1
+                        sample_labels[0, :min(4, visual_indices.numel())] = 1
                         # n_t = target_indices.size(0)          # 目标 token 个数
                         # n_v = visual_indices.size(0)
                         # sample_labels = torch.zeros(
