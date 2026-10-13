@@ -8,10 +8,7 @@ import torch
 import transformers
 from liger_kernel.transformers import apply_liger_kernel_to_qwen2_vl
 from PIL import ImageFile
-from transformers import (
-    Qwen2VLForConditionalGeneration,
-    AutoProcessor,
-)
+from transformers import AutoProcessor
 
 from LaVCOT.dataset import LazySupervisedDataset
 from LaVCOT.trainer import AGUVISTrainer, rank0_print, safe_save_model_for_hf_trainer
@@ -245,7 +242,7 @@ def train():
         )
     else:
         raise ValueError(f"Invalid model type: {model_args.model_type}")
-    model.config.use_cache = False
+    model.config.use_cache = True
     model.reset_loss_weights(pointer_loss_weight=training_args.pointer_loss_weight, lm_loss_weight=training_args.lm_loss_weight)
 
     if training_args.gradient_checkpointing:
@@ -309,7 +306,7 @@ def train():
         emb_param.register_hook(mask_grad)
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
+        trainer.train(resume_from_checkpoint=False)
     else:
         trainer.train()
     trainer.save_state()
