@@ -50,6 +50,8 @@ from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 
 from trainer.image_pro import process_vision_info
+from LaVCOT import inference as lavcot_inference
+from LaVCOT import modeling_qwen25vl as lavcot_modeling
 import copy
 import numpy as np
 import gc

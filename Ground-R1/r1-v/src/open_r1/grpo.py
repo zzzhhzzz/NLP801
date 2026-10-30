@@ -537,11 +537,9 @@ def main(script_args, training_args, model_args):
     trainer_cls = Qwen2VLGRPOTrainer
     print("using: ", trainer_cls)
 
-    if os.path.isdir("/home/meng/GRPO/src/outputs/datav3_simple_qdwqdnobbox_reward_twostageT_KL/checkpoint-500"):
-        last_checkpoint = "/home/meng/GRPO/src/outputs/datav3_simple_nobbox_reward_twostageT_KL/checkpoint-500"
+    last_checkpoint = get_last_checkpoint(training_args.output_dir) if os.path.isdir(training_args.output_dir) else None
+    if last_checkpoint:
         print(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
-    else:
-        last_checkpoint = None
 
     # Initialize the GRPO trainer
     trainer = trainer_cls(
