@@ -11,3 +11,10 @@ chat_template = "{% set image_count = namespace(value=0) %}{% set video_count = 
 assistant_template = chat_template
 
 ADDITIONAL_SPECIAL_TOKENS = [DEFAULT_POINTER_PAD_TOKEN]
+
+STAGE_ONE_TEMPLATE = (
+    "{Question} Your task is to locate the region that corresponds to the question. To indicate the region, we will use some special tokens, which is used to refer to a visual patch later. For example, you can output: <your_special_token_here>."
+)
+STAGE_TWO_TEMPLATE = (
+    "{Question} Refer to the region extracted in the previous turn and provide the final answer."
+)

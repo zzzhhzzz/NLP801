@@ -50,6 +50,7 @@ from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 
 from trainer.image_pro import process_vision_info
+from LaVCOT.constants import STAGE_TWO_TEMPLATE
 from LaVCOT import inference as lavcot_inference
 from LaVCOT import modeling_qwen25vl as lavcot_modeling
 import copy
@@ -68,14 +69,6 @@ if is_wandb_available():
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 ScoreFunc = Union[str, PreTrainedModel, Callable[[list], list[float]]]
 
-STAGE_ONE_TEMPLATE = (
-    "Question: {Question}\n"
-    "Based on the original image and the question, reason whether there exists a region in the image that could help you answer the question better. If such a region exists, provide one bounding box coordinate in the format [x1,y1,x2,y2] inside the <box> and </box> tags."
-    "The size of the image: Width:{input_width}, Height:{input_height}. The bounding box you provided should not exceed the image width and height."
-    "Then, you will receive a cropped image based on the bounding box. Use both images to continue reasoning inside a new <think> tag. You may conduct multiple rounds of grounding to refine your region as you want. The bounding box you provide should always be selected based on the original image."
-    "If at any point you determine no further visual information is needed, you may directly provide the final answer inside the <answer> and </answer> tags."
-    "Format Example: <think> Reasoning </think> <box>[x1,y1,x2,y2]</box> OR <think> Reasoning </think> <answer> final answer </answer>"
-)
 
 def bbox_adjust(bbox, input_width, input_height, width, height, min_size=28):
     x1, y1, x2, y2 = bbox
@@ -421,7 +414,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                 {"type": "image"},
                 {
                     "type": "text",
-                    "text": STAGE_ONE_TEMPLATE.format(Question=origin_problem, input_width=input_width, input_height=input_height)
+                    "text": STAGE_TWO_TEMPLATE.format(Question=origin_problem)
                 },
             ],
         }
@@ -429,7 +422,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         origin_prompt.extend([
         {
             "role": "assistant",
-            "content": [{"type": "text", "text": str(bbox)}]
+            "content": [{"type": "text", "text": str(bbox).split("<|im_end|>", 1)[0].split("<|endoftext|>", 1)[0].strip()}]
         },
         copy.deepcopy(next_stage_entry)
         ])
@@ -556,7 +549,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                     generated_ids_list.append(out_ids[input_length:])
 
                 output_text_stage1_list = self.processing_class.batch_decode(
-                    generated_ids_list, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                    generated_ids_list, skip_special_tokens=False, clean_up_tokenization_spaces=False
                 )
 
                 del generated_ids_list
@@ -579,7 +572,7 @@ class Qwen2VLGRPOTrainer(Trainer):
 
                         
                         if all_completions[idx] is None:
-                            if ("<answer>" in output_text_stage1_list[idx] or iteration == 4):
+                            if iteration >= 1:
                             # if "<answer>" in output_text_stage1_list[idx]:
                                 all_completions[idx] = completion_stage1[idx].unsqueeze(0)
                         
@@ -611,7 +604,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                         ]
                         ## output_text_stage2_list
                         output_text_stage1_list = self.processing_class.batch_decode(
-                            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                            generated_ids_trimmed, skip_special_tokens=False, clean_up_tokenization_spaces=False
                         )
                     else:
                         dummy_config = copy.deepcopy(temp_generation_config)
@@ -763,9 +756,9 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         # Decode the generated completions
         ### 之前completion_ids做了截断，现在没有
-        completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=False)
         if is_conversational(inputs[0]):
-            completions = [re.findall(r'(?<=\nassistant\n)(.*?)(?=\nuser\n|\Z)', completion, re.S) for completion in completions]
+            completions = [re.findall(r"<\|im_start\|>assistant\n(.*?)(?=<\|im_end\|>|<\|endoftext\|>|<\|im_start\|>|\Z)", completion, re.S) for completion in completions]
             # completions = [[{"role": "assistant", "content": completion}] for completion in completions]
 
         # Compute the rewards

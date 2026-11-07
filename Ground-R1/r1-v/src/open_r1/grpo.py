@@ -26,6 +26,7 @@ from trainer import Qwen2VLGRPOTrainer
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 from transformers.trainer_utils import get_last_checkpoint
 from datasets import Dataset, DatasetDict
+from LaVCOT.constants import DEFAULT_POINTER_PAD_TOKEN, STAGE_ONE_TEMPLATE
 from accuracy_reward_functions import v7w, docVQA, Math_eureka, ocr_and_freeform, openend_datasets, deepeyes_visual_toolbox, output_json_for_selection
 
 def compute_iou(gt_bbox, student_bbox):
@@ -108,6 +109,7 @@ dataset_handlers = {
     "cub": (openend_datasets, False),
     "visual_toolbox_v2": (deepeyes_visual_toolbox, False),
     "data_thinklite_reasoning_acc": (Math_eureka, False),
+    "minio3": (deepeyes_visual_toolbox, False),
 }
 
 @dataclass
@@ -126,7 +128,7 @@ class GRPOScriptArguments(ScriptArguments):
     )
     score_funcs: list[str] = field(
         # default_factory=lambda: ["bbox_stage1", "bbox_stage2", "accuracy_stage1", "accuracy_stage2", "bbox_iou_stage1", "bbox_iou_stage2", "bbox_iou_stage3"],
-        default_factory=lambda: ["refine_times"],
+        default_factory=lambda: ["accuracy_reward_stage2"],
     )
 
     max_pixels: Optional[int] = field(
@@ -142,28 +144,44 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "generations in stage1"},
     )
 
+def clean_completion(content):
+    content = content.split("<|im_start|>assistant\n", 1)[-1]
+    if content.startswith("assistant\n"):
+        content = content[len("assistant\n"):]
+    return content.split("<|im_end|>", 1)[0].split("<|endoftext|>", 1)[0].strip()
+
+
+def score_completion(content, solution, dataset_name):
+    content = clean_completion(content)
+    if not content or dataset_name not in dataset_handlers:
+        return 0.0, content
+    handler, needs_dataset_arg = dataset_handlers[dataset_name]
+    solutions = solution if isinstance(solution, list) else [solution]
+    best_reward, student_answer = 0.0, content
+    for sol in solutions:
+        sol = str(sol)
+        match = re.search(r"<answer>(.*?)</answer>", sol, re.DOTALL)
+        ground_truth = match.group(1).strip() if match else sol.strip()
+        if not ground_truth:
+            continue
+        if needs_dataset_arg:
+            reward, candidate = handler(content, ground_truth, dataset_name)
+        else:
+            reward, candidate = handler(content, ground_truth)
+        if reward >= best_reward:
+            best_reward, student_answer = reward, candidate
+    return best_reward, student_answer
+
+
 def accuracy_reward_stage2(completions, solution, dataset, image, problem_id, **kwargs):
 
-    completion_contents_stage2 = [completion[-1] for completion in completions]
+    completion_contents_stage2 = [completion[-1] if len(completion) >= 2 else "" for completion in completions]
 
     rewards = []
 
-    for content_stage2, sol in zip(completion_contents_stage2, solution):
-
-        if isinstance(sol, list):
-            pass
-        else:
-            sol_match = re.search(r'<answer>(.*?)</answer>', sol)
-            ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
-
-        if dataset[0] in dataset_handlers:
-            handler_func, needs_dataset_arg = dataset_handlers[dataset[0]]
-            if needs_dataset_arg:
-                reward, student_answer = handler_func(content_stage2, ground_truth, dataset[0])
-            else:
-                reward, student_answer = handler_func(content_stage2, ground_truth)
-        else:
-            print(f"Error: no handler_func for dataset: {dataset[0]}")
+    for index, (content_stage2, sol, dataset_name) in enumerate(zip(completion_contents_stage2, solution, dataset)):
+        content_stage2 = clean_completion(content_stage2)
+        reward, student_answer = score_completion(content_stage2, sol, dataset_name)
 
         rewards.append(reward)
 
@@ -172,7 +190,7 @@ def accuracy_reward_stage2(completions, solution, dataset, image, problem_id, **
             log_path = os.getenv("LOG_PATH")
             with open(log_path, "a", encoding='utf-8') as f:
                 f.write(f"------------- {current_time} Accuracy reward: tage2——{reward} -------------\n")
-                f.write(f"---------------\"problem_id\": {problem_id[0]}--------------------------\n")
+                f.write(f"---------------\"problem_id\": {problem_id[index]}--------------------------\n")
                 f.write(f"Content_last_stage: {content_stage2}\n")
                 f.write(f"Content Match Stage2: {student_answer}\n")
                 f.write(f"Solution: {sol}\n")
@@ -184,108 +202,25 @@ def accuracy_reward_stage2(completions, solution, dataset, image, problem_id, **
     return rewards
 
 def accuracy_score_stage1(completions, solution, dataset, image, problem_id, **kwargs):
+    return [
+        score_completion(completion[0] if completion else "", sol, dataset_name)[0]
+        for completion, sol, dataset_name in zip(completions, solution, dataset)
+    ]
 
-    completion_contents_stage1 = [completion[0] for completion in completions]
-    scores = []
-
-    for content, sol in zip(completion_contents_stage1, solution):
-
-        if isinstance(sol, list):
-            pass
-        else:
-            sol_match = re.search(r'<answer>(.*?)</answer>', sol)
-            ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
-
-        if dataset[0] in dataset_handlers:
-            handler_func, needs_dataset_arg = dataset_handlers[dataset[0]]
-            if needs_dataset_arg:
-                reward, student_answer = handler_func(content, ground_truth, dataset[0])
-            else:
-                reward, student_answer = handler_func(content, ground_truth)
-        else:
-            print(f"Error: no handler_func for dataset: {dataset[0]}")
-
-        scores.append(reward)
-
-    return scores
 
 def accuracy_score_stage2(completions, solution, dataset, image, problem_id, **kwargs):
-
-    completion_contents_stage2 = [completion[1] for completion in completions]
-    scores = []
-
-    for content, sol in zip(completion_contents_stage2, solution):
-
-        if isinstance(sol, list):
-            pass
-        else:
-            sol_match = re.search(r'<answer>(.*?)</answer>', sol)
-            ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
-
-        if dataset[0] in dataset_handlers:
-            handler_func, needs_dataset_arg = dataset_handlers[dataset[0]]
-            if needs_dataset_arg:
-                reward, student_answer = handler_func(content, ground_truth, dataset[0])
-            else:
-                reward, student_answer = handler_func(content, ground_truth)
-        else:
-            print(f"Error: no handler_func for dataset: {dataset[0]}")
+    return [
+        score_completion(completion[-1] if len(completion) >= 2 else "", sol, dataset_name)[0]
+        for completion, sol, dataset_name in zip(completions, solution, dataset)
+    ]
 
 
-        scores.append(reward)
+def format_reward_stage1_pointerpad(completions, **kwargs):
+    return [
+        float(bool(completion) and clean_completion(completion[0]) == DEFAULT_POINTER_PAD_TOKEN)
+        for completion in completions
+    ]
 
-    return scores
-
-def format_reward_all_stage(completions, **kwargs):
-    """Reward function that checks if the completion has a specific format."""
-
-    box_pattern = r"\[\s*(\d+\.?\d*)\s*,\s*(\d+\.?\d*)\s*,\s*(\d+\.?\d*)\s*,\s*(\d+\.?\d*)\s*\]"
-    pattern_stage1 = (
-        fr"^(?=(?:.*<think>))(?=(?:.*</think>))"
-        fr"(?=(?:.*<box>))(?=(?:.*</box>))"
-        fr"(?!.*<think>.*<think>)(?!.*</think>.*</think>)"
-        fr"(?!.*<box>.*<box>)(?!.*</box>.*</box>)"
-        fr"^<think>(.+?)</think>\s*<box>{box_pattern}</box>$"
-    )
-    pattern_stage2 = (
-
-        r"^(?=(?:.*<think>){1})(?=(?:.*<\/think>){1})"
-        r"(?=(?:.*<answer>){1})(?=(?:.*<\/answer>){1})"
-
-        r"(?!.*<think>.*<think>)"
-        r"(?!.*<\/think>.*<\/think>)"
-        r"(?!.*<answer>.*<answer>)"
-        r"(?!.*<\/answer>.*<\/answer>)"
-
-        fr"^<think>(.+?)</think>\s*<answer>.+?</answer>$"
-    )
-    def _compute_format_reward(pattern, content):
-        return 1.0 if re.fullmatch(pattern, content, re.DOTALL) else 0.0
-
-    total_format_rewards = []
-
-    for completion in completions:
-        rewards = []
-        for i, content in enumerate(completion):
-            if i == len(completion) - 1:
-                pattern = pattern_stage2
-            else:
-                pattern = pattern_stage1
-            reward = _compute_format_reward(pattern, content)
-            rewards.append(reward)
-        average_reward = 2*sum(rewards) / len(rewards) if rewards else 0.0
-        total_format_rewards.append(average_reward)
-
-        if os.getenv("DEBUG_MODE") == "true":
-            log_path = os.getenv("LOG_PATH")
-            current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
-            with open(log_path, "a", encoding='utf-8') as f:
-                f.write(f"------------- {current_time} Format reward -----------------\n")
-                f.write(f"Stage_Length: {len(completion)} \n")
-                f.write(f"Answer: {completion} \n")
-                f.write(f"Total: {average_reward}\n")
-
-    return total_format_rewards
 
 def refine_times(completions, **kwargs):
 
@@ -453,7 +388,7 @@ def bbox_iou_stage3(crop_bbox_to_cal_iou_stage3, bboxs, problem_id, image, datas
 
 reward_funcs_registry = {
     "accuracy": accuracy_reward_stage2,
-    "format": format_reward_all_stage,
+    "format": format_reward_stage1_pointerpad,
     # "bbox": bbox_reward_stage2,
     # "bbox_stage1": bbox_score_stage1,
     # "accuracy_stage1": accuracy_score_stage1,
@@ -463,7 +398,7 @@ log_score_funcs_regitry = {
     # "bbox_stage2": bbox_score_stage2,
     # "accuracy_stage2": accuracy_score_stage2,
     # "bbox_score_stage1": bbox_score_stage1,
-    # "accuracy_reward_stage2": accuracy_reward_stage2,
+    "accuracy_reward_stage2": accuracy_score_stage2,
     "refine_times": refine_times,
     # "bbox_score_stage2": bbox_reward_stage2,
     # "bbox_iou_stage1": bbox_iou_stage1,
@@ -485,15 +420,6 @@ def main(script_args, training_args, model_args):
         dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
 
 
-    STAGE_ONE_TEMPLATE = (
-        "Question: {Question}\n"
-        "Based on the original image and the question, reason whether there exists a region in the image that could help you answer the question better. If such a region exists, provide one bounding box coordinate in the format [x1,y1,x2,y2] inside the <box> and </box> tags."
-        "The size of the image: Width:{input_width}, Height:{input_height}. The bounding box you provided should not exceed the image width and height."
-        "Then, you will receive a cropped image based on the bounding box. Use both images to continue reasoning inside a new <think> tag. You may conduct multiple rounds of grounding to refine your region as you want. The bounding box you provide should always be selected based on the original image."
-        "If at any point you determine no further visual information is needed, you may directly provide the final answer inside the <answer> and </answer> tags."
-        "Format Example: <think> Reasoning </think> <box>[x1,y1,x2,y2]</box> OR <think> Reasoning </think> <answer> final answer </answer>"
-    )
-
     def make_conversation_image(example):
         
         return {
@@ -504,7 +430,7 @@ def main(script_args, training_args, model_args):
                     "content": [
                         {"type": "image"},
                         # {"type": "text", "text": BBOX_QUESTION_TEMPLATE.format(Question=example["problem"])},
-                        {"type": "text", "text": STAGE_ONE_TEMPLATE.format(Question=example["problem"],input_width=example["input_width"],input_height=example["input_height"])},
+                        {"type": "text", "text": STAGE_ONE_TEMPLATE.format(Question=example["problem"])},
                     ],
                 },
                 # {"role": "assistant", "content": [{"type": "text", "text": "(141,236),(217,287)"}]},
