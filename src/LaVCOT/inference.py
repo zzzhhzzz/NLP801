@@ -304,3 +304,157 @@ def inference(conversation,
         pred["bboxes_scores"] = scores
 
     return pred
+
+
+@torch.no_grad()
+def inference_rl_batch(prompt_inputs, generation_config, model, tokenizer,
+                       use_placeholder=False, topk=5, conv_iteration=1,
+                       patch_sample_tau=1.0, enable_hidden_noise=False,
+                       pointer_noise_sigma=0.5):
+    if patch_sample_tau <= 0 or topk < 1 or pointer_noise_sigma < 0:
+        raise ValueError("Temperature and topk must be positive; noise sigma must be nonnegative.")
+    if getattr(generation_config, "num_beams", 1) != 1:
+        raise ValueError("RL sampling requires num_beams=1.")
+    was_training = model.training
+    model.eval()
+    try:
+        results = model.generate(
+            **prompt_inputs, generation_config=generation_config,
+            return_dict_in_generate=True, output_hidden_states=False, use_cache=True,
+        )
+        sequences = results.sequences
+        prompt_length = prompt_inputs["input_ids"].shape[1]
+        batch_size = prompt_inputs["input_ids"].shape[0]
+        repeats = sequences.shape[0] // batch_size
+        predictions = []
+        for sequence in sequences:
+            predictions.append({
+                "output_text": tokenizer.decode(sequence[prompt_length:], skip_special_tokens=False,
+                                                clean_up_tokenization_spaces=False),
+                "generated_ids_list": sequence.detach(),
+                "valid_pointer": False,
+                "ptr_action_patch": None,
+                "ptr_logp_old": None,
+                "patch_sample_tau": patch_sample_tau,
+                "n_width": None,
+                "n_height": None,
+                "attn_scores": None,
+                "bboxes": [],
+                "bboxes_scores": [],
+                "chosen_bbox": None,
+                "chosen_bbox_idx": None,
+                "topk_points": [],
+                "topk_values": [],
+                "topk_points_all": [],
+            })
+        if conv_iteration != 1:
+            return predictions
+        pointer_id = getattr(model.config, "pointer_pad_token_id", None)
+        if pointer_id is None:
+            token_ids = tokenizer.encode(DEFAULT_POINTER_PAD_TOKEN, add_special_tokens=False)
+            if len(token_ids) != 1 or token_ids[0] == tokenizer.unk_token_id:
+                raise ValueError("The tokenizer must contain the LaVCOT pointer token.")
+            pointer_id = token_ids[0]
+        expanded_ids, expanded = model._expand_inputs_for_generation(
+            expand_size=repeats, is_encoder_decoder=False, **dict(prompt_inputs)
+        )
+        generated = sequences[:, prompt_length:]
+        generated_mask = torch.ones_like(generated)
+        eos_ids = getattr(generation_config, "eos_token_id", None)
+        if eos_ids is None:
+            eos_ids = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+        if eos_ids is None:
+            eos_ids = tokenizer.eos_token_id
+        if eos_ids is not None:
+            eos_ids = eos_ids if isinstance(eos_ids, (list, tuple)) else [eos_ids]
+            is_eos = torch.zeros_like(generated, dtype=torch.bool)
+            for eos_id in eos_ids:
+                is_eos |= generated == eos_id
+            generated_mask = (is_eos.long().cumsum(-1) - is_eos.long() == 0).long()
+        prompt_mask = expanded.pop("attention_mask", torch.ones_like(expanded_ids))
+        attention_mask = torch.cat([prompt_mask, generated_mask], dim=1)
+        for key in ("position_ids", "cache_position", "past_key_values", "rope_deltas"):
+            expanded.pop(key, None)
+        pointer_mask = sequences == pointer_id
+        pointer_mask &= attention_mask.bool()
+        if not use_placeholder:
+            pointer_mask[:, :prompt_length] = False
+        if not pointer_mask.any() or "image_grid_thw" not in expanded:
+            return predictions
+        outputs = model(input_ids=sequences, attention_mask=attention_mask,
+                        **expanded, output_hidden_states=True, return_dict=True, use_cache=False)
+        hidden = outputs.hidden_states[-1]
+        image_token_id = model.config.image_token_id
+        merge = model.visual.spatial_merge_size
+        grid_offset = 0
+        head = model.multi_patch_pointer_head
+        for index, pred in enumerate(predictions):
+            image_start = sequences[index] == model.config.vision_start_token_id
+            image_count = int((image_start[:-1] & (sequences[index, 1:] == image_token_id)).sum().item())
+            grids = expanded["image_grid_thw"][grid_offset:grid_offset + image_count]
+            grid_offset += image_count
+            positions = pointer_mask[index].nonzero(as_tuple=True)[0]
+            if positions.numel() == 0 or image_count != 1:
+                continue
+            temporal, height, width = grids[0].tolist()
+            if temporal != 1:
+                continue
+            height, width = height // merge, width // merge
+            image_hidden = hidden[index][sequences[index] == image_token_id]
+            if image_hidden.shape[0] != height * width:
+                raise ValueError("Image grid and visual token count do not match.")
+            pointer_hidden = hidden[index, positions[0]].unsqueeze(0)
+            if enable_hidden_noise:
+                noise = torch.randn_like(pointer_hidden) * pointer_noise_sigma
+                pointer_hidden = pointer_hidden + noise
+                pred["pointer_noise"] = noise.detach()
+            logits = head.projection_dec(pointer_hidden) @ head.projection_enc(image_hidden).transpose(0, 1)
+            logits = logits.float() / (head.d_model ** 0.5)
+            distribution = torch.distributions.Categorical(logits=logits[0] / patch_sample_tau)
+            action = distribution.sample()
+            scores = torch.softmax(logits, dim=-1)
+            boxes, box_scores = get_activation_bboxes(scores, width, height,
+                                                       activation_threshold=0.15, connectivity=8)
+            x, y = int(action.item()) % width, int(action.item()) // width
+            point = ((x + 0.5) / width, (y + 0.5) / height)
+            chosen_index = next((i for i, box in enumerate(boxes)
+                                 if box[0] <= point[0] < box[2] and box[1] <= point[1] < box[3]), None)
+            chosen_box = boxes[chosen_index] if chosen_index is not None else (
+                x / width, y / height, (x + 1) / width, (y + 1) / height
+            )
+            _, centers, region_scores, points = get_prediction_region_point(scores, width, height)
+            pred.update(
+                valid_pointer=True, ptr_action_patch=int(action.item()),
+                ptr_logp_old=float(distribution.log_prob(action).item()),
+                n_width=width, n_height=height, attn_scores=scores.tolist(),
+                bboxes=boxes, bboxes_scores=box_scores,
+                chosen_bbox=chosen_box, chosen_bbox_idx=chosen_index,
+                topk_points=centers[:topk], topk_values=region_scores[:topk],
+                topk_points_all=points[:topk],
+            )
+        return predictions
+    finally:
+        model.train(was_training)
+
+
+def inference_rl(prompt_inputs, generation_config, model, tokenizer,
+                 use_placeholder=False, enable_hidden_noise=False, topk=5,
+                 conv_iteration=1, patch_sample_tau=1.0, pointer_noise_sigma=0.5):
+    return inference_rl_batch(
+        prompt_inputs, generation_config, model, tokenizer,
+        use_placeholder=use_placeholder, topk=topk, conv_iteration=conv_iteration,
+        patch_sample_tau=patch_sample_tau, enable_hidden_noise=enable_hidden_noise,
+        pointer_noise_sigma=pointer_noise_sigma,
+    )
+
+
+def inference_rl_noise(prompt_inputs, generation_config, model, tokenizer,
+                       use_placeholder=False, enable_hidden_noise=True,
+                       pointer_noise_sigma=0.5, topk=5, conv_iteration=1,
+                       patch_sample_tau=1.0):
+    return inference_rl_batch(
+        prompt_inputs, generation_config, model, tokenizer,
+        use_placeholder=use_placeholder, topk=topk, conv_iteration=conv_iteration,
+        patch_sample_tau=patch_sample_tau, enable_hidden_noise=enable_hidden_noise,
+        pointer_noise_sigma=pointer_noise_sigma,
+    )

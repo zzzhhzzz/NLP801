@@ -26,17 +26,12 @@ import transformers
 from datasets import Dataset, IterableDataset
 from packaging import version
 from transformers import (
-    AriaForConditionalGeneration,
-    AriaProcessor,
-    AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoProcessor,
     AutoTokenizer,
     GenerationConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
-    Qwen2VLForConditionalGeneration,
-    Qwen2_5_VLForConditionalGeneration,
     Trainer,
     TrainerCallback,
     is_wandb_available,
@@ -50,9 +45,9 @@ from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 
 from trainer.image_pro import process_vision_info
-from LaVCOT.constants import STAGE_TWO_TEMPLATE
-from LaVCOT import inference as lavcot_inference
-from LaVCOT import modeling_qwen25vl as lavcot_modeling
+from LaVCOT.constants import DEFAULT_POINTER_PAD_TOKEN, STAGE_TWO_TEMPLATE, chat_template
+from LaVCOT.inference import inference_rl, inference_rl_noise, inference_rl_batch
+from LaVCOT.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
 import copy
 import numpy as np
 import gc
@@ -174,15 +169,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                 False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
             )
             model_init_kwargs["torch_dtype"] = torch.bfloat16
-            if "Qwen2-VL" in model_id:
-                model = Qwen2VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
-            elif "Qwen2.5-VL" in model_id:
-                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
-            elif "Aria" in model_id:
-                model_init_kwargs.pop("use_cache")
-                model = AriaForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
-            else:
-                model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
+            model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(model_id, **model_init_kwargs)
         else:
             model_id = model.config._name_or_path
             if args.model_init_kwargs is not None:
@@ -201,15 +188,7 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         # Reference model
         if is_deepspeed_zero3_enabled():
-            if "Qwen2-VL" in model_id:
-                self.ref_model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
-            elif "Qwen2.5-VL" in model_id:
-                # self.ref_model = None
-                self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
-            elif "Aria" in model_id:
-                self.ref_model = AriaForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
-            else:
-                self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
+            self.ref_model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(model_id, **model_init_kwargs)
         elif peft_config is None:
             # If PEFT configuration is not provided, create a reference model based on the initial model.
             self.ref_model = create_reference_model(model)
@@ -220,20 +199,20 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         # Processing class
         if processing_class is None:
-            if "Qwen2-VL" in model_id or "Qwen2.5-VL" in model_id or "Aria" in model_id:
-                processing_class = AutoProcessor.from_pretrained(model_id)
-                pad_token_id = processing_class.tokenizer.pad_token_id
-                processing_class.pad_token_id = pad_token_id
-                processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
-                if "Qwen" in model_id or "Qwen2.5-VL" in model_id:
-                    processing_class.image_processor.max_pixels = max_pixels
-                    processing_class.image_processor.min_pixels = min_pixels
-            else:
-                processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
-                pad_token_id = processing_class.pad_token_id
-
-        chat_template_new = "{% set image_count = namespace(value=0) %}{% set video_count = namespace(value=0) %}{% for message in messages %}{% if loop.first and message['role'] != 'system' %}<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n{% endif %}<|im_start|>{{ message['role'] }}\n{% if message['content'] is string %}{{ message['content'] }}<|im_end|>\n{% else %}{% for content in message['content'] %}{% if content['type'] == 'image' or 'image' in content or 'image_url' in content %}{% set image_count.value = image_count.value + 1 %}Picture {{ image_count.value }}: <|vision_start|><|image_pad|><|vision_end|>{% elif content['type'] == 'video' or 'video' in content %}{% set video_count.value = video_count.value + 1 %}Video {{ video_count.value }}: <|vision_start|><|video_pad|><|vision_end|>{% elif 'text' in content %}{{ content['text'] }}{% endif %}{% endfor %}<|im_end|>\n{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
-        processing_class.chat_template = chat_template_new
+            processing_class = AutoProcessor.from_pretrained(model_id)
+        processing_class.tokenizer.padding_side = "left"
+        pad_token_id = processing_class.tokenizer.pad_token_id
+        processing_class.pad_token_id = pad_token_id
+        processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
+        processing_class.image_processor.max_pixels = max_pixels
+        processing_class.image_processor.min_pixels = min_pixels
+        processing_class.chat_template = chat_template
+        pointer_ids = processing_class.tokenizer.encode(DEFAULT_POINTER_PAD_TOKEN, add_special_tokens=False)
+        if len(pointer_ids) != 1 or pointer_ids[0] == processing_class.tokenizer.unk_token_id:
+            raise ValueError("The checkpoint tokenizer must contain the LaVCOT pointer token.")
+        model.config.pointer_pad_token_id = pointer_ids[0]
+        if self.ref_model is not None:
+            self.ref_model.config.pointer_pad_token_id = pointer_ids[0]
 
         # Reward functions
         if not isinstance(reward_funcs, list):
